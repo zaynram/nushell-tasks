@@ -161,12 +161,13 @@ export def edit [
 
 # Remove a task from the in-memory database and from its source file.
 export def del [
-  where?: string
+  where?: string@_db-fields # Raw SQL predicate selecting the tasks to delete
   --id: string@_task-ids # Delete the task holding this id
   --all # Delete all tasks
   --sync = true # Pull source-file edits into the database first
   --check = true # Run tombi against source files after updating them
   --commit = true # Record syncs as commits in the source repositories
+  --write (-w) = true # Automatically write the database to disk after deleting
 ]: nothing -> table {
   ensure-db --sync=$sync
   let clause: any = $where | default (if $id != null { $"id LIKE '($id | sql-str)'" })
@@ -194,10 +195,14 @@ export def del [
       | write-source $path --check=$check --commit=$commit
     } catch {|e| print --stderr $"warning: ($e.msg)" }
   }
-  match $clause {
+  # Unsourced rows have no file to prune, so without a dump their deletion
+  # would evaporate with the process.
+  let out: any = match $clause {
     null => { stor delete --table-name $DB.name }
     $w => { stor delete --table-name $DB.name --where-clause $w }
   }
+  if $write { dump }
+  $out
 }
 
 # Revert a task's most recent synced change using its source repository.
@@ -256,8 +261,8 @@ export def sub [
   --add (-a): record<synopsis: string> # Add a subtask for this task
   --index (-i): record # Insert subtask(s) given as {<index>: <subtask>}
   --set (-s): record # Merge partial fields into subtask(s) given as {<index>: <partial record>}
-  --done (-d): int = -1 # Mark the subtask at an index as done (undo via --set {<index>: {done: false}})
-  --pop (-p): int = -1 # Pop a subtask at an index
+  --done (-d): int@_subtask-indices = -1 # Mark the subtask at an index as done (undo via --set {<index>: {done: false}})
+  --pop (-p): int@_subtask-indices = -1 # Pop a subtask at an index
   --sync = true # Pull source-file edits into the database first
   --check = true # Run tombi against source files after updating them
   --commit = true # Record syncs as commits in the source repositories
@@ -815,6 +820,23 @@ def _task-ids []: nothing -> list<string> {
   # --sync=false: completions stay snappy.
   ensure-db --sync=false
   query-tasks --select 'DISTINCT id' | get id
+}
+
+# Offer the indices of the task already typed on the line, described by
+# their synopses. The id is the positional following `sub`.
+def _subtask-indices [context: string]: nothing -> table<value: string, description: string> {
+  ensure-db --sync=false
+  let id: any = $context
+    | split row --regex '\s+'
+    | skip until { $in == 'sub' }
+    | get --optional 1
+  if ($id | is-empty) { return [] }
+  query-tasks --select 'id, subtasks' --where $"id LIKE '($id | sql-str)'"
+  | get --optional 0
+  | if ($in | is-empty) { [] } else {
+    subtask-hydrate
+    | each { {value: ($in.index | into string) description: $in.item.synopsis} }
+  }
 }
 
 def _db-fields []: nothing -> list<string> {
