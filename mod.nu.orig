@@ -1,0 +1,239 @@
+# nu-lint-ignore-file: positional_to_pipeline, chained_str_transform
+const PROJECTS: directory = $nu.home-dir | path join code
+const DB: record = {
+  name: tasks
+  file: ($nu.data-dir | path join stor nudb.sqlite)
+  columns: {
+    id: str
+    date: datetime
+    project: jsonb
+    subtasks: jsonb
+  }
+  types: {
+    id: string
+    date: datetime
+    project: `record<name: string, path: directory>`
+    subtasks: `record<[int]: record<synopsis: string, done: bool, llm: string>>`
+  }
+  enums: {
+    subtasks.llm: [none augmentation automation]
+  }
+}
+
+def project-names []: nothing -> list<directory> {
+  cd $PROJECTS
+  glob * --no-file --no-symlink | path basename
+}
+
+def task-ids []: nothing -> list<string> {
+  ensure-db
+  stor open | query db $'SELECT id from ($DB.name)' | values | flatten | uniq
+}
+
+def "type fields" []: string -> list {
+  str replace --regex ^\w+< ''
+  | str replace --regex >$ ''
+  | split row ', '
+  | each {|pair|
+    let kv = $pair | split row ': '
+    {name: ($kv.0? | str trim) type: ($kv.1? | str trim)}
+  }
+}
+
+def db-fields []: any -> list {
+  $DB.columns | items {|col datatype|
+    if $DB.types has $col and $datatype == jsonb {
+      let type: string = $DB.types | get --optional $col
+      $type | type fields | each {|f|
+        if $type =~ ^record {
+          [$"($col)->>'($f.name)'"]
+        } else if $type =~ ^table {
+          [$"($col).($f.name)"]
+        }
+      }
+    } | prepend $col
+  } | flatten | compact | uniq
+}
+
+def ensure-db []: nothing -> table {
+  let query: string = $"SELECT name FROM sqlite_master WHERE type='table' AND name='($DB.name)'"
+  if (stor open | query db $query | is-not-empty) { return }
+  if ($DB.file | path exists) {
+    stor import --file-name $DB.file
+    mv --force --update $DB.file $'($DB.file).bak'
+  } else {
+    stor create --table-name $DB.name --columns $DB.columns
+    mkdir --verbose ($DB.file | path dirname)
+    for row in [
+      [name field];
+      [task_idx id]
+      [project_idx `project->'name'`]
+    ] {
+      stor open | query db $"CREATE UNIQUE INDEX ($row.name) ON ($DB.name) \(($row.field))"
+    }
+  }
+}
+
+# Add a task to the in-memory `tasks` database.
+export def create [
+  id?: string # Descriptive identifier for the task
+  --auto-save = true # Automatically write the database to disk after adding the task
+  --project (-p): string@project-names # The project associated with the task
+  --subtasks (-s): table<synopsis: string> # Subtasks for this task
+]: [
+  nothing -> oneof<table, nothing>
+  table<id: string, project: record<name: string, path: directory>, subtasks: table<synopsis: string>> -> table
+  record<id: string, project: record<name: string, path: directory>, subtasks: table<synopsis: string>> -> table
+] {
+  ensure-db
+  let data: any = $in | default []
+  match ($id | describe) {
+    nothing if $data == null => { error make --unspanned 'no tasks were provided' }
+    nothing if ($data | describe) =~ record => [$data]
+    string => {
+      $data | append {
+        id: $id
+        project: {
+          name: $project
+          path: ($PROJECTS | path join $project)
+        }
+        subtasks: $subtasks
+      }
+    }
+    _ => $data
+  } | compact
+  | default { date now } date
+  | default {name: global path: null} project
+  | default [] subtasks
+  | %update subtasks {
+    default false done
+    | default none llm
+    | enumerate
+    | par-each --keep-order { {($in.index): ($in.item)} }
+    | into record
+  }
+  | stor insert --table-name $DB.name
+  | if $auto_save { write } else { }
+}
+
+# Retrieve tasks from the in-memory database.
+export def main [
+  ...fields: string@db-fields # The fields to select from the data
+  --id: string@task-ids # Filter by task ID likeness ('%' = wildcard, '_' = wildcard (single char))
+  --project: string@project-names # Filter by exact project name
+]: nothing -> table {
+  ensure-db
+  let select: string = $fields | default --empty [*] | str join ,
+  let where: string = match {id: $id project: $project} {
+    {id: null project: null} => ''
+    {id: null project: $p} => { $"project->>'name' = '($project)'" }
+    {id: $i project: null} => { $"id LIKE '($i)'" }
+    {id: $i project: $p} => { $"id LIKE '($i)' AND project->>'name' = '($project)'" }
+  }
+  query-tasks --select $select --where $where
+}
+
+# Return the database schema or information about its types.
+export def schema [
+  --list-columns # Return the database columns and data types
+  --list-types # Return the Nushell columns and types for the update record
+  --list-enums # Return the values for enumerables
+]: nothing -> table {
+  if $list_columns { return $DB.columns }
+  if $list_types { return $DB.types }
+  if $list_enums { return $DB.enums }
+  write; open $DB.file | %schema
+}
+
+def update-tasks [id: oneof<nothing, string>]: record -> table {
+  let data: record = $in
+  match $id {
+    null => (
+      stor update
+      --table-name $DB.name
+      --update-record $data
+    )
+    _ => (
+      stor update
+      --table-name $DB.name
+      --update-record $data
+      --where-clause $"id LIKE '($id)'"
+    )
+  }
+}
+
+def query-tasks [
+  --set: string
+  --select: string
+  --where: string
+]: nothing -> table {
+  let q: string = if $set != null {
+    [UPDATE $DB.name SET $set]
+  } else if $select != null {
+    [SELECT $select FROM $DB.name]
+  } | if ($where | is-empty) { } else { append [WHERE $where] }
+    | str join (char space)
+  stor open | query db $q
+}
+
+# Update a task from the in-memory database.
+export def update [
+  id: string@task-ids # The id of the task to update (can include wildcards)
+  --set-clause: string # Raw SET query string (without leading SET; cannot be combined with other flags)
+  --update: oneof<record, record<date: datetime>> = {
+  } # Record containing changes to make to the task
+  --subtask: closure # Replace the subtasks with the resulting table of a closure given the subtasks as input and the whole task as an argument.
+  --set-project: string@project-names # Update the project record to target this project
+]: oneof<nothing, record> -> table {
+  if $set_clause != null {
+    query-tasks --set $set_clause --where $"id LIKE '($id)'"
+  } else {
+    let base: record = $in | default {} | merge $update
+    let data: record = match {
+      sub: $subtask
+      proj: $set_project
+    } {
+      {sub: null proj: null} => $base
+      {sub: $s proj: $p} => {
+        let row: record = (
+          query-tasks
+          --select subtasks
+          --where $"id LIKE '($id)'"
+        ) | into record
+          | upsert subtasks $s
+          | merge $base
+        if $set_project == null { $row } else {
+          let path: path = $PROJECTS | path join $p
+          $row | upsert project {name: $p path: $path}
+        }
+      }
+    }
+
+    if ($data | is-empty) {
+      error make --unspanned 'no update data was provided'
+    } else {
+      $data | update-tasks $id
+    }
+  }
+}
+
+# Persist the tasks from the in-memory database.
+export def write []: nothing -> table {
+  ensure-db
+  if ($DB.file | path exists) { rm --force $DB.file }
+  stor export --file-name $DB.file
+}
+
+# Remove a task from the in-memory database.
+export def delete [
+  where?: string
+  --id: string # Delete the task holding this id
+  --all # Delete all tasks
+]: nothing -> table {
+  ensure-db
+  match ($where | default { if $id != null { $"id LIKE '($id)'" } }) {
+    null if $all => { stor delete --table-name $DB.name }
+    null => { error make --unspanned 'filter is required without `--all`' }
+    $w => { stor delete --table-name $DB.name --where-clause $w }
+  }
+}
