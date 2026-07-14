@@ -1,3 +1,5 @@
+# Track issues and subtasks in a sqlite store, with TOML issue files as the source of truth.
+
 # nu-lint-ignore-file: positional_to_pipeline, chained_str_transform, missing_in_type, missing_output_type
 
 const PROJECTS: directory = $nu.home-dir | path join code
