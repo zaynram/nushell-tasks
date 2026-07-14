@@ -1,6 +1,6 @@
 # Track issues and subtasks in a sqlite store, with TOML issue files as the source of truth.
 
-# nu-lint-ignore-file: positional_to_pipeline, chained_str_transform, missing_in_type, missing_output_type
+# nu-lint-ignore-file: positional_to_pipeline, chained_str_transform, missing_in_type, missing_output_type, max_positional_params
 
 const PROJECTS: directory = $nu.home-dir | path join code
 const GLOBAL: record<name: string, path: oneof<nothing, directory>> = {
@@ -225,29 +225,29 @@ export def undo [
   }
   let path: path = $task | heal-source
   let dir: directory = $path | path dirname
-  if (do { ^git -C $dir rev-parse --is-inside-work-tree } | complete).exit_code != 0 {
+  if (do { git -C $dir rev-parse --is-inside-work-tree } | complete).exit_code != 0 {
     error make --unspanned $"($path) is not in a git repository; there is no history to undo from"
   }
-  let head: string = do { ^git -C $dir symbolic-ref --short --quiet HEAD } | complete | get stdout | str trim
+  let head: string = do { git -C $dir symbolic-ref --short --quiet HEAD } | complete | get stdout | str trim
   let branch: any = (open $path).issue?.reference?.branch?
   let target: string = if ($branch | is-empty) { $head } else { $branch }
-  let root: path = ^git -C $dir rev-parse --show-toplevel | str trim
+  let root: path = git -C $dir rev-parse --show-toplevel | str trim
   let rel: string = $path | path relative-to $root
   # Absolute pathspecs: `log -- <path>` resolves relative to the cwd, and the
   # repo-root-relative form would silently miss from inside a subdirectory.
-  let last_sync: string = do { ^git -C $dir log -1 --format=%H --grep '^tasks: ' $target -- $path } | complete | get stdout | str trim
+  let last_sync: string = do { git -C $dir log -1 --format=%H --grep '^tasks: ' $target -- $path } | complete | get stdout | str trim
   if ($last_sync | is-empty) {
     error make --unspanned $"no sync commits touch ($rel) on '($target)'"
   }
-  let last_touch: string = ^git -C $dir log -1 --format=%H $target -- $path | str trim
+  let last_touch: string = git -C $dir log -1 --format=%H $target -- $path | str trim
   if $last_touch != $last_sync {
     error make --unspanned $"($rel) has non-sync commits after its last sync on '($target)'; revert manually"
   }
-  let prev: string = try { ^git -C $dir show $"($last_sync)^:($rel)" } catch {
+  let prev: string = try { git -C $dir show $"($last_sync)^:($rel)" } catch {
     error make --unspanned $"($rel) does not exist before its first sync; nothing to restore"
   }
   $prev | save --force --raw $path
-  let subject: string = ^git -C $dir log -1 --format=%s $last_sync | str trim
+  let subject: string = git -C $dir log -1 --format=%s $last_sync | str trim
   commit-source $path $"tasks: undo ($path | path basename)\n\nThis reverts ($last_sync | str substring 0..11) \(($subject))." $branch
   let out: table = import-file $path
   if $write { dump }
@@ -465,7 +465,7 @@ def import-file [path: path]: nothing -> table {
 def get-project [name: oneof<nothing, string>]: nothing -> record<name: string, path: oneof<nothing, directory>> {
   if $name == null { return $GLOBAL }
   cd $PROJECTS
-  glob $name --no-file
+  glob $"**/($name)" --no-file
   | if ($in | is-empty) {
     error make --unspanned $"no project directory matches '($name)'"
   } else { first }
@@ -660,7 +660,7 @@ def sync-summary [tasks: record path: path]: record -> string {
           _ if $o == $n => null
           _ => {
             let fields: string = $n | columns
-              | where {|c| ($o | get --optional $c) != ($n | get --optional $c) }
+              | where ($o | get --optional $it) != ($n | get --optional $it)
               | str join ', '
             $"~ ($n.id? | default $k): ($fields)"
           }
@@ -681,13 +681,13 @@ def sync-summary [tasks: record path: path]: record -> string {
 # even while the repository sits elsewhere.
 def commit-source [path: path message: string branch: oneof<nothing, string>]: nothing -> nothing {
   let dir: directory = $path | path dirname
-  if (do { ^git -C $dir rev-parse --is-inside-work-tree } | complete).exit_code != 0 { return }
-  let head: string = do { ^git -C $dir symbolic-ref --short --quiet HEAD } | complete | get stdout | str trim
+  if (do { git -C $dir rev-parse --is-inside-work-tree } | complete).exit_code != 0 { return }
+  let head: string = do { git -C $dir symbolic-ref --short --quiet HEAD } | complete | get stdout | str trim
   let target: string = if ($branch | is-empty) { $head } else { $branch }
   if $target == $head {
     let commit: record = do {
-      ^git -C $dir add -- $path
-      ^git -C $dir commit --quiet --message $message -- $path
+      git -C $dir add -- $path
+      git -C $dir commit --quiet --message $message -- $path
     } | complete
     if $commit.exit_code != 0 {
       use std/log warning
@@ -697,27 +697,27 @@ def commit-source [path: path message: string branch: oneof<nothing, string>]: n
     return
   }
   try {
-    let parent: string = ^git -C $dir rev-parse --verify --quiet $"refs/heads/($target)" | str trim
-    let root: path = ^git -C $dir rev-parse --show-toplevel | str trim
-    let blob: string = ^git -C $dir hash-object -w -- $path | str trim
+    let parent: string = git -C $dir rev-parse --verify --quiet $"refs/heads/($target)" | str trim
+    let root: path = git -C $dir rev-parse --show-toplevel | str trim
+    let blob: string = git -C $dir hash-object -w -- $path | str trim
     # Stage the synced content into the current checkout's index too: checkout
     # refuses to switch over an unstaged modification (it compares against the
     # index, not the target), while a staged entry equal to the target's blob
     # carries across cleanly — no stash dance to reach the issue branch.
-    ^git -C $dir add -- $path
+    git -C $dir add -- $path
     let idx: path = mktemp --tmpdir tasks-git-index-XXXXXX
     let tree: string = with-env {GIT_INDEX_FILE: $idx} {
-      ^git -C $dir read-tree $parent
-      ^git -C $dir update-index --add --cacheinfo $"100644,($blob),($path | path relative-to $root)"
-      ^git -C $dir write-tree | str trim
+      git -C $dir read-tree $parent
+      git -C $dir update-index --add --cacheinfo $"100644,($blob),($path | path relative-to $root)"
+      git -C $dir write-tree | str trim
     }
     rm --force $idx
     # The branch may already carry this exact content (e.g. synced there by
     # another checkout); an empty commit would only be noise.
-    if $tree == (^git -C $dir rev-parse $"($parent)^{tree}" | str trim) { return }
-    let commit: string = $message | ^git -C $dir commit-tree $tree -p $parent | str trim
+    if $tree == (git -C $dir rev-parse $"($parent)^{tree}" | str trim) { return }
+    let commit: string = $message | git -C $dir commit-tree $tree -p $parent | str trim
     # Compare-and-swap on the parent: never clobber a ref that moved under us.
-    ^git -C $dir update-ref $"refs/heads/($target)" $commit $parent
+    git -C $dir update-ref $"refs/heads/($target)" $commit $parent
   } catch {
     use std/log warning
     warning --short $"could not commit the sync of ($path | path basename) to branch '($target)' \(does it exist?); the change is written but uncommitted"
@@ -829,8 +829,8 @@ def _task-ids []: nothing -> list<string> {
 def _subtask-indices [context: string]: nothing -> table<value: string, description: string> {
   ensure-db --sync=false
   let id: any = $context
-    | split row --regex '\s+'
-    | skip until { $in == 'sub' }
+    | split row --regex \s+
+    | skip until { $in == sub }
     | get --optional 1
   if ($id | is-empty) { return [] }
   query-tasks --select 'id, subtasks' --where $"id LIKE '($id | sql-str)'"
