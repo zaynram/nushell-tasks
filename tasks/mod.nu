@@ -2,11 +2,39 @@
 
 # nu-lint-ignore-file: positional_to_pipeline, chained_str_transform, missing_in_type, missing_output_type, max_positional_params
 
-const PROJECTS: directory = $nu.home-dir | path join code
-const GLOBAL: record<name: string, path: oneof<nothing, directory>> = {
-  name: global
-  path: $PROJECTS
+export-env {
+  $env
+  | get --ignore-case --optional nu-tasks-project-dir
+  | default {
+    if $env has repo and $env.repo has path and ($env.repo.path | is-not-empty) {
+      # If the `repo` module is active in this environment, use the existing list of projects
+      $env.repo.path | get directory
+    } else {
+      # Else, collect them manually and reuse the logic for getting most common parent
+      glob $"($nu.home-dir)/**/.git" --no-file --no-symlink --depth=3 | path dirname
+    } | path dirname | uniq --count | last
+  } | if ($in | is-not-empty) {
+    # If there is a directory found, use it as the projects directory
+    get value | path expand --strict --no-symlink
+  } else {
+    # Else, make a default directory in the user's local data directory
+    let p: path = $env.XDG_DATA_HOME?
+      | default { $nu.home-dir | path join .local share }
+      | path join nu-tasks projects
+    mkdir $p; $p
+  }
+  | wrap project-dir
+  | insert global-project {|row|
+    let p: path = $row.project-dir | path join .tasks global
+    mkdir $p; {name: global path: $p}
+  }
+  | rename --block { prepend [nu-tasks] | str join '-' }
+  | load-env
 }
+
+def projects []: nothing -> directory { $env.nu-tasks-project-dir }
+def global []: nothing -> record<name: string, path: directory> { $env.nu-tasks-global-project }
+
 # Issue-schema version the importer understands; imports from other versions
 # proceed with a warning.
 const SCHEMA_VERSION: string = '3.0.0'
@@ -14,13 +42,14 @@ const DB: record = {
   name: tasks
   file: ($nu.data-dir | path join stor nudb.sqlite)
   columns: {
-    id: str
-    date: datetime
-    project: jsonb
-    subtasks: jsonb
-    target: str
-    completed: str
-    source: jsonb
+    id: 'VARCHAR(255)'
+    date: DATETIME
+    project: JSONB
+    subtasks: JSONB
+    target: TEXT
+    completed: TEXT
+    registered: BOOLEAN
+    source: JSONB
   }
   types: {
     id: string
@@ -29,6 +58,7 @@ const DB: record = {
     subtasks: `record<[int]: record<synopsis: string, done: bool, llm: string>>`
     target: `oneof<nothing, string>`
     completed: `oneof<nothing, string>`
+    registered: bool
     source: `oneof<nothing, record<path: path, key: string>>`
   }
   enums: {
@@ -42,6 +72,7 @@ export def list [
   --id: string@_task-ids # Filter by task ID likeness ('%' = str wildcard, '_' = char wildcard)
   --project: string@_project-names # Filter by exact project name
   --sync = true # Pull source-file edits into the database first
+  --raw (-r) = false # Return the raw data without rehydrating any Nushell types or unwrapping nested data
 ]: nothing -> table {
   ensure-db --sync=$sync
   let select: string = append $field | default --empty [*] | str join ,
@@ -50,6 +81,9 @@ export def list [
     (if $project != null { $"project->>'name' = '($project | str trim --char / | sql-str)'" })
   ] | compact | str join ' AND '
   query-tasks --select $select --where $where
+  | if $raw { return $in } else { }
+  | if ($in.date? | describe) not-in [nothing datetime] { update date { into datetime } }
+  | if ($in.project? | describe) not-in [nothing string] { update project { get name } }
 }
 
 # Add a task to the in-memory `tasks` database.
@@ -58,6 +92,7 @@ export def add [
   --project (-p): string@_project-names # The project associated with the task
   --subtasks (-s): table<synopsis: string> # Subtasks for this task (appended to pipeline input)
   --write (-w) = true # Automatically write the database to disk after adding the task
+  --register (-r) = true # Register the task with the taskwarrior CLI
 ]: [
   nothing -> nothing
   table<synopsis: string> -> nothing
@@ -71,7 +106,8 @@ export def add [
   | insert date { date now }
   | insert project { get-project $project }
   | stor insert --table-name $DB.name
-  | if $write { dump } else { ignore }
+  | if $write { dump }
+  if $register { job spawn { register --id=$id } | ignore }
 }
 
 # Import tasks from an issue file's `tasks` property, tracking the file as their source.
@@ -313,7 +349,6 @@ export def main [
       | insert done { $subs | where $it.item.done | length }
     } $in
     | merge ($t | select id date)
-    | insert project $t.project.name
   }
 }
 
@@ -376,7 +411,123 @@ export def dump []: nothing -> nothing {
   mv --force $tmp $DB.file
 }
 
+# Register task ids as contexts in the Taskwarrior CLI.
+export def register [
+  --id (-i): string@_task-ids # Filter by task ID likeness ('%' = str wildcard, '_' = char wildcard)
+  --project (-p): string@_project-names # Filter by exact project name
+  --no-confirm (-n) # Disable taskwarrior's confirmation system (requires interactivity)
+]: nothing -> nothing {
+  let confirmation: bool = query-task-confirmation
+  if $no_confirm { task config confirmation 0 }
+  let contexts = get-task-contexts
+  alias is-context = do {|x?: string| default $x | $contexts.name has $in }
+  alias ls = list --raw=true --sync=false
+  match ({id: $id project: $project} | compact --empty) {
+    {id: $i project: $p} => { ls --id=$i --project=$p }
+    {id: $i} => { ls --id=$i }
+    {project: $p} => { ls --project=$p }
+    _ => { ls }
+  } | if ($in | is-empty) {
+    error make --unspanned 'no tasks matched the provided arguments'
+  } else {
+    let queue: table<name: string, tasks: table, tag: string, project: string> = $in
+      | where not ($it.registered | into bool --relaxed) and ($it.completed | is-empty)
+      | par-each {|row|
+        if $row.project?.name? != null { $row.project.name | str replace --all '-' '_' } else { 'global' }
+        | wrap project
+        | insert tag { $row.id | str replace --all '-' '_' | prepend + | str join }
+        | insert tasks { $row.subtasks | values | enumerate | flatten item }
+        | insert name $row.id
+      }
+    for row in $queue {
+      for sub in $row.tasks {
+        task description:($sub.synopsis) out+err>|
+        | lines
+        | where not ($it starts-with 'Recently upgraded')
+        | str join "\n"
+        | if $in !~ 'No matches' { task $"description:($sub.synopsis)" delete }
+        task add $"project:($row.project)" $row.tag -- $"[($sub.llm)] ($sub.synopsis)"
+      }
+      if not ($row.name | is-context) { task context define $row.name $"project.is:($row.project)" and $row.tag }
+      edit $row.name --update={registered: true}
+    }
+    for ctx in (get-task-contexts | where name in $queue.name) {
+      task context $ctx.name
+      task list | print
+      task context none
+    }
+  }
+  if $no_confirm { job spawn { task config confirmation ($confirmation | into int) out+err>| } | ignore }
+}
+
+# Unregister a task from the taskwarrior CLI.
+export def unregister [
+  --id (-i): string@_task-ids # Filter by task ID likeness ('%' = str wildcard, '_' = char wildcard)
+  --project (-p): string@_project-names # Filter by exact project name
+  --no-confirm (-n) # Disable taskwarrior's confirmation system (requires interactivity)
+]: nothing -> nothing {
+  let confirmation: bool = query-task-confirmation
+  if $no_confirm { task config confirmation 0 }
+  let contexts = get-task-contexts
+  alias is-context = do {|x?: string| default $x | $contexts.name has $in }
+  alias ls = list --raw=true --sync=false
+  match ({id: $id project: $project} | compact --empty) {
+    {id: $i project: $p} => { ls --id=$i --project=$p }
+    {id: $i} => { ls --id=$i }
+    {project: $p} => { ls --project=$p }
+    _ => { ls }
+  } | if ($in | is-not-empty) {
+    let queue = $in | where ($it.registered | into bool --relaxed)
+    for row in $queue {
+      for sub in $row.tasks {
+        task $"description:($sub.synopsis)" out+err>|
+        | lines
+        | where not ($it starts-with 'Recently upgraded')
+        | str join "\n"
+        | if $in !~ 'No matches' { task $"description:($sub.synopsis)" delete }
+      }
+      if not ($row.id | is-context) { task context delete $row.id out+err>| ignore }
+      edit $row.id --update={registered: false}
+    }
+  }
+  if $no_confirm { job spawn { task config confirmation ($confirmation | into int) out+err>| } | ignore }
+}
+
 ## Utilities
+
+def require-taskwarrior []: nothing -> oneof<nothing, error> {
+  if (which task --all | is-not-empty) { return }
+  error make --unspanned {
+    msg: 'this feature requires taskwarrior to be installed'
+    code: `tasks::missing_dependency::taskwarrior_cli`
+    help: $"ensure taskwarrior is installed and `('task' | nu-highlight)` is on PATH"
+  }
+}
+
+def get-task-contexts []: nothing -> table<name: string, active: bool> {
+  require-taskwarrior
+  task context list out+err>|
+  | lines
+  | where $it not-has '----' and $it != 'No contexts defined.'
+  | str join "\n"
+  | from ssv --aligned-columns --minimum-spaces=1
+  | rename --block={ str lowercase } # nu-lint-ignore: nu_parse_error
+  | reject definition type
+  | where name != ''
+  | update active { $in != no }
+}
+
+def query-task-confirmation []: nothing -> bool {
+  task show confirmation out+err>|
+  | lines
+  | where $it has confirmation
+  | first
+  | parse --regex 'confirmation\s+(?<enabled>\d)'
+  | into record
+  | get --optional enabled
+  | default true
+  | into bool
+}
 
 # Ensure the database has been initialized and mirrors the source files.
 # Captures and returns any pipeline input for use at the start of database operation functions.
@@ -417,8 +568,8 @@ def import-file [path: path]: nothing -> table {
     error make --unspanned $"($path) has no tasks to import"
   }
   let project: record = try {
-    get-project ($path | path relative-to $PROJECTS | path split | first)
-  } catch { $GLOBAL }
+    get-project ($path | path relative-to (projects) | path split | first)
+  } catch { global }
   let rows: table = $entries | items {|key t|
       {
         id: $t.id
@@ -426,6 +577,7 @@ def import-file [path: path]: nothing -> table {
         project: $project
         subtasks: ($t.subtasks | subtask-pack)
         target: ($t.target? | default null)
+        registered: ($t.completed? | into bool --relaxed)
         # match, not `not`: completed is false | date-string, and boolean
         # `not` on the date-string form throws. A TOML LocalDate parses as a
         # datetime — store the plain date string the schema means by it.
@@ -463,9 +615,8 @@ def import-file [path: path]: nothing -> table {
 }
 
 def get-project [name: oneof<nothing, string>]: nothing -> record<name: string, path: oneof<nothing, directory>> {
-  if $name == null { return $GLOBAL }
-  cd $PROJECTS
-  glob $"**/($name)" --no-file
+  if $name == null { return (global) }
+  glob $"(projects)/**/($name)" --no-file --depth=3
   | if ($in | is-empty) {
     error make --unspanned $"no project directory matches '($name)'"
   } else { first }
@@ -746,7 +897,7 @@ def is-tasks-header []: string -> bool {
 def heal-source []: record -> path {
   let task: record = $in
   if ($task.source.path | path exists) { return $task.source.path }
-  let root: directory = $task.project.path | default $PROJECTS
+  let root: directory = $task.project.path | default { projects }
   let hits: list = glob --no-dir ($root | path join ** ($task.source.path | path basename))
   match ($hits | length) {
     1 => {
@@ -814,8 +965,8 @@ def sql-str []: string -> string {
 ## Completions
 
 def _project-names []: nothing -> list<directory> {
-  cd $PROJECTS
-  glob * --no-file --no-symlink | path basename
+  if $env has repo and $env.repo has path and ($env.repo.path | is-not-empty) { return $env.repo.path.name }
+  glob $"(globals | get path)/*" --no-file --no-symlink | path basename
 }
 
 def _task-ids []: nothing -> list<string> {
