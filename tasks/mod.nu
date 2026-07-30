@@ -49,8 +49,11 @@ export def list [
     (if $id != null { $"id LIKE '($id | sql-str)'" })
     (if $project != null { $"project->>'name' = '($project | str trim --char / | sql-str)'" })
   ] | compact | str join ' AND '
-  query-tasks --select $select --where $where
+  query-tasks --select $select --where $where | update date { into datetime }
 }
+
+# Show the tasks, without auto-synchronization.
+export alias show = list --sync=false
 
 # Add a task to the in-memory `tasks` database.
 export def add [
